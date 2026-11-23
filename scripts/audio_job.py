@@ -130,17 +130,30 @@ def recognize(folder, state, model_name, language, report, stop):
                 beam_size=1 if model_name == "base" else 5, word_timestamps=True,
             )
             chunk = []
+            word_times = {}
             for seg in segments:
                 check_pause(stop)
                 start = round((pos / RATE + seg.start) * 1000)
                 end = round(min((pos + length) / RATE, pos / RATE + seg.end) * 1000)
                 if seg.text.strip() and end > start:
+                    if state.get("request", {}).get("speakers") and seg.words:
+                        words = []
+                        for word in seg.words:
+                            a = max(start, round((pos / RATE + word.start) * 1000))
+                            b = min(end, round((pos / RATE + word.end) * 1000))
+                            if b > a:
+                                words.append([a, b, word.word])
+                            elif words:
+                                words[-1][2] += word.word
+                        word_times[str(len(cues) + len(chunk))] = words
                     chunk.append((start, end, seg.text.strip()))
             if chunk and not state.get("detected_language"):
                 state["detected_language"] = info.language
             pos += length
             audio.setpos(pos)
             cues.extend(chunk)
+            if word_times:
+                state.setdefault("words", {}).update(word_times)
             state["cursor"] = pos
             save_json(folder / "state.json", state)
             report("本机转写", 100 * pos / total)

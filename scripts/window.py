@@ -42,6 +42,7 @@ class Window:
         self.mode = tk.StringVar(value=prefs.get("mode", next(iter(MODES))))
         self.language = tk.StringVar(value=prefs.get("language", "自动识别"))
         self.audio_only = tk.BooleanVar(value=prefs.get("audio_only", False))
+        self.speakers = tk.BooleanVar(value=prefs.get("speakers", True))
         self.status = tk.StringVar(value="就绪")
         self.stop = threading.Event()
         self.events = queue.Queue()
@@ -77,10 +78,12 @@ class Window:
             self.editable.append(combo)
         audio = ttk.Checkbutton(options, text="忽略字幕，按原声转写", variable=self.audio_only)
         audio.pack(side="left")
-        self.editable.extend((audio, self.source_entry, browse, dest, dest_button))
+        speakers = ttk.Checkbutton(panel, text="区分发言人", variable=self.speakers)
+        speakers.grid(row=5, column=1, sticky="e")
+        self.editable.extend((audio, speakers, self.source_entry, browse, dest, dest_button))
 
         actions = ttk.Frame(panel)
-        actions.grid(row=5, column=0, columnspan=2, sticky="w", pady=(15, 5))
+        actions.grid(row=5, column=0, sticky="w", pady=(15, 5))
         self.start_button = ttk.Button(actions, text="开始 / 继续", command=self.start)
         self.start_button.pack(side="left")
         self.pause_button = ttk.Button(actions, text="暂停", command=self.pause, state="disabled")
@@ -121,6 +124,7 @@ class Window:
             self.mode.set(next(k for k, v in MODES.items() if v == req["model"]))
             self.language.set(next(k for k, v in LANGUAGES.items() if v == req["language"]))
             self.audio_only.set(req["from_audio"])
+            self.speakers.set(req.get("speakers", True))
             self.status.set("已选中任务。点「开始 / 继续」恢复。")
         cache = Path(self.output.get()).expanduser() / ".video-link-transcript"
         for path in sorted(cache.glob("*/state.json")):
@@ -153,9 +157,10 @@ class Window:
             self.status.set("请填写视频来源和保存位置。")
             return
         mode, lang, audio = self.mode.get(), self.language.get(), self.audio_only.get()
+        speakers = self.speakers.get()
         try:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
-            save_json(CONFIG, dict(source=source, output=dest, mode=mode, language=lang, audio_only=audio))
+            save_json(CONFIG, dict(source=source, output=dest, mode=mode, language=lang, audio_only=audio, speakers=speakers))
         except OSError as exc:
             self.status.set(f"无法保存窗口设置：{exc}")
             return
@@ -173,7 +178,7 @@ class Window:
                 self.events.put(("progress", (stage, percent)))
             try:
                 result = run_job(source, Path(dest).expanduser(), MODES[mode], LANGUAGES[lang],
-                                 audio, report, self.stop)
+                                 audio, report, self.stop, speakers=speakers)
                 self.events.put(("done", result))
             except Paused:
                 self.events.put(("paused", "已暂停。点「开始 / 继续」可从上次保存的位置继续。"))

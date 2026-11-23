@@ -99,7 +99,24 @@ def tracks(info, language):
     return sorted(choices, key=lambda item: item[0])
 
 
-def extract_captions(ydl, info, language, temp):
+def labeled(cues):
+    return bool(cues) and all(re.match(r"^发言人\d+\s*[:：]", text) for _, _, text in cues)
+
+
+def caption_cues(data, ext, automatic, speakers):
+    if speakers and ext == "vtt" and "<v" in data:
+        names = {}
+        def voice(match):
+            name = html.unescape(match.group(1)).strip()
+            return f"发言人{names.setdefault(name, len(names) + 1)}："
+        marked = re.sub(r"<v(?:\.[^\s>]+)?\s+([^>]+)>", voice, data)
+        cues = list(read_cues(marked, ext, automatic))
+        if labeled(cues):
+            return cues
+    return list(read_cues(data, ext, automatic))
+
+
+def extract_captions(ydl, info, language, temp, speakers):
     for index, (_, lang, automatic, fmt) in enumerate(tracks(info, language)):
         try:
             ext = fmt["ext"]
@@ -109,7 +126,7 @@ def extract_captions(ydl, info, language, temp):
                 download = {"http_headers": info.get("http_headers") or {}, **fmt}
                 ydl.dl(str(path), download, subtitle=True)
                 data = path.read_text(encoding="utf-8-sig")
-            cues = list(read_cues(data, ext, automatic))
+            cues = caption_cues(data, ext, automatic, speakers)
             if cues:
                 return cues, lang, "平台自动字幕" if automatic else "平台字幕"
         except (DownloadError, OSError, ValueError, TypeError, KeyError) as exc:
@@ -136,10 +153,13 @@ def save_result(output, title, cues):
     return plain.resolve(), timed.resolve()
 
 
-def online_source(source, folder, state, language, from_audio, report, stop):
+def online_source(source, folder, state, language, from_audio, report, stop, speakers):
+    result = state.get("captions")
+    if result and (not speakers or labeled(result[0])):
+        return None, result
     previous = state.get("media")
     if previous and (folder / previous).is_file():
-        return folder / previous, None
+        return folder / previous, result
     last_update = 0
     stage = "读取平台字幕"
 
@@ -177,11 +197,14 @@ def online_source(source, folder, state, language, from_audio, report, stop):
             raise ValueError("请提供单个已发布视频的链接。")
         state["title"] = info.get("title") or "video"
         ydl.params.update(writesubtitles=False, writeautomaticsub=False)
-        if not from_audio:
+        if not from_audio and result is None:
             report("读取平台字幕", None)
-            result = extract_captions(ydl, info, language, folder)
+            result = extract_captions(ydl, info, language, folder, speakers)
             if result:
-                return None, result
+                if not speakers or labeled(result[0]):
+                    return None, result
+                state["captions"] = result
+                save_json(folder / "state.json", state)
         check_pause(stop)
         stage = "下载媒体"
         report(stage, None)
@@ -191,10 +214,10 @@ def online_source(source, folder, state, language, from_audio, report, stop):
             raise ValueError("下载结束后没有找到媒体文件。")
         state["media"] = media.name
         save_json(folder / "state.json", state)
-        return media, None
+        return media, result
 
 
-def local_captions(media, language, stop):
+def local_captions(media, language, stop, speakers):
     # Prefer an explicitly named language track, then the matching plain sidecar.
     stems = [media.stem]
     if language and re.fullmatch(r"[A-Za-z0-9-]+", language):
@@ -204,7 +227,7 @@ def local_captions(media, language, stop):
             path = media.with_name(f"{stem}.{ext}")
             if path.is_file():
                 try:
-                    cues = list(read_cues(path.read_text(encoding="utf-8-sig"), ext, False))
+                    cues = caption_cues(path.read_text(encoding="utf-8-sig"), ext, False, speakers)
                 except UnicodeDecodeError:
                     continue
                 if cues:
@@ -242,7 +265,7 @@ def local_captions(media, language, stop):
     return None
 
 
-def run_job(source, output, model, language, from_audio, report, stop):
+def run_job(source, output, model, language, from_audio, report, stop, speakers=True):
     source = source.strip().strip('"')
     local, folder = job_paths(source, output, model, language, from_audio)
     folder.mkdir(parents=True, exist_ok=True)
@@ -253,12 +276,13 @@ def run_job(source, output, model, language, from_audio, report, stop):
     with lock:
         checkpoint = folder / "state.json"
         state = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else {}
-        state["request"] = dict(source=str(local or source), model=model, language=language or "", from_audio=from_audio)
+        state["request"] = dict(source=str(local or source), model=model, language=language or "",
+                                from_audio=from_audio, speakers=speakers)
         state.setdefault("title", local.stem if local else (urlsplit(source).hostname or "视频"))
         save_json(checkpoint, state)
         media = local
         audio = folder / "audio.wav"
-        result = None
+        result = state.get("captions")
         if not audio.is_file():
             if state.get("cursor"):
                 raise ValueError("断点所需的音频已丢失。请另选输出目录重新开始。")
@@ -266,23 +290,32 @@ def run_job(source, output, model, language, from_audio, report, stop):
                 state["title"] = local.stem
                 if not from_audio:
                     report("检查本地字幕", None)
-                    result = local_captions(local, language, stop)
+                    result = local_captions(local, language, stop, speakers)
             else:
-                media, result = online_source(source, folder, state, language, from_audio, report, stop)
+                media, result = online_source(source, folder, state, language, from_audio, report, stop, speakers)
             check_pause(stop)
-            if result is None:
+            if result is None or (speakers and not labeled(result[0])):
+                if result:
+                    state["captions"] = result
                 save_json(checkpoint, state)
                 decode_audio(media, audio, report, stop)
+        if audio.is_file() and state.get("media"):
+            (folder / state.pop("media")).unlink(missing_ok=True)
+            save_json(checkpoint, state)
         if result is None:
-            if state.get("media"):
-                (folder / state.pop("media")).unlink(missing_ok=True)
-                save_json(checkpoint, state)
             result = recognize(folder, state, model, base_lang(language) or None, report, stop)
         cues, lang, origin = result
+        if speakers and not labeled(cues):
+            from speakers import diarize, label_cues
+            turns = diarize(folder, report, stop)
+            check_pause(stop)
+            cues = label_cues(cues, state.get("words", {}), turns)
+            origin += " · 本地发言人分析"
         plain, timed = save_result(output, state["title"], cues)
         # This directory is private to a single hashed job. Only remove our files.
         checkpoint.unlink(missing_ok=True)
         audio.unlink(missing_ok=True)
+        (folder / "speakers.json").unlink(missing_ok=True)
         for path in folder.glob("captions-*"):
             if path.is_file():
                 path.unlink(missing_ok=True)
@@ -295,6 +328,7 @@ def main():
     parser.add_argument("source", help="单个视频链接，或本地视频、音频文件路径")
     parser.add_argument("--language", help="视频原声语言，例如 zh 或 en")
     parser.add_argument("--from-audio", action="store_true", help="直接按原声转写")
+    parser.add_argument("--no-speakers", action="store_true", help="跳过发言人分析")
     parser.add_argument("--model", default="small", help="本地 Whisper 模型路径或名称")
     parser.add_argument("--output-dir", type=Path, default=Path("transcripts"))
     args = parser.parse_args()
@@ -308,7 +342,7 @@ def main():
             last = mark
 
     result = run_job(args.source, args.output_dir, args.model, args.language,
-                     args.from_audio, report, threading.Event())
+                     args.from_audio, report, threading.Event(), speakers=not args.no_speakers)
     plain, timed, lang, origin, count = result
     print(f"来源：{origin}；语言：{lang}；共 {count} 段\n逐字稿：{plain}\n时间轴：{timed}")
 

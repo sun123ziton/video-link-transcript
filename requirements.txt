@@ -2,3 +2,5 @@ yt-dlp>=2025.10.14
 faster-whisper>=1.2.1,<2
 # faster-whisper 1.2.1 passes metadata_errors to av.open.
 av>=14,<17
+filelock>=3.13,<5
+tkinterdnd2>=0.4.3,<1

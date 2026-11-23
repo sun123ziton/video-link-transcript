@@ -5,10 +5,14 @@ import html
 import json
 import re
 import sys
+import threading
+import time
 import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from filelock import FileLock, Timeout
+from audio_job import Paused, check_pause, decode_audio, job_paths, recognize, save_json
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, sanitize_filename
 
@@ -113,30 +117,6 @@ def extract_captions(ydl, info, language, temp):
     return None
 
 
-def transcribe_audio(ydl, info, language, model):
-    from faster_whisper import WhisperModel
-
-    print("正在下载音轨并在本机转写…", file=sys.stderr)
-    ydl.process_info(dict(info))
-    media = ydl.prepare_filename(info)
-    try:
-        recognizer = WhisperModel(model, device="cpu", compute_type="int8", local_files_only=True)
-    except (OSError, FileNotFoundError, RuntimeError, ValueError):
-        recognizer = WhisperModel(model, device="cpu", compute_type="int8")
-    segments, details = recognizer.transcribe(
-        media, language=base_lang(language) or None, vad_filter=True,
-        vad_parameters={"threshold": 0.30, "min_silence_duration_ms": 650},
-        word_timestamps=True,
-    )
-    cues = []
-    for item in segments:
-        if item.text.strip():
-            cues.append((round(item.start * 1000), round(item.end * 1000), item.text.strip()))
-    if not cues:
-        raise ValueError("没有识别到可转写的人声。")
-    return cues, details.language, f"本地语音识别（{Path(model).name}）"
-
-
 def save_result(output, title, cues):
     output.mkdir(parents=True, exist_ok=True)
     prefix = sanitize_filename(title, restricted=False).strip(" .")[:60] or "video"
@@ -156,34 +136,181 @@ def save_result(output, title, cues):
     return plain.resolve(), timed.resolve()
 
 
+def online_source(source, folder, state, language, from_audio, report, stop):
+    previous = state.get("media")
+    if previous and (folder / previous).is_file():
+        return folder / previous, None
+    last_update = 0
+    stage = "读取平台字幕"
+
+    def progress(event):
+        nonlocal last_update
+        check_pause(stop)
+        now = time.monotonic()
+        if now - last_update < 0.4:
+            return
+        last_update = now
+        total = event.get("total_bytes") or event.get("total_bytes_estimate")
+        pct = min(100, 100 * event.get("downloaded_bytes", 0) / total) if total else None
+        report(stage, pct)
+
+    options = {
+        "quiet": True, "noprogress": True, "noplaylist": True,
+        "playlistend": 1, "extract_flat": "in_playlist", "socket_timeout": 30,
+        "writesubtitles": not from_audio, "writeautomaticsub": not from_audio,
+        "format": "bestaudio/best", "outtmpl": str(folder / "media.%(ext)s"),
+        "progress_hooks": [progress], "skip_unavailable_fragments": False,
+    }
+    report("解析视频链接", None)
+    with YoutubeDL(options) as ydl:
+        try:
+            info = ydl.extract_info(source, download=False)
+        except DownloadError as exc:
+            reason = str(exc).lower()
+            if any(hint in reason for hint in ("/login", "login required", "sign in", "log in")):
+                raise ValueError("平台要求登录。可拖入已取得的本地视频、录音，或粘贴可播放的媒体直链。") from exc
+            if "unsupported url" in reason:
+                raise ValueError("暂时无法解析这个页面。请使用媒体直链，或拖入本地视频、录音。") from exc
+            raise
+        check_pause(stop)
+        if not info or info.get("_type") in ("playlist", "multi_video") or info.get("is_live"):
+            raise ValueError("请提供单个已发布视频的链接。")
+        state["title"] = info.get("title") or "video"
+        ydl.params.update(writesubtitles=False, writeautomaticsub=False)
+        if not from_audio:
+            report("读取平台字幕", None)
+            result = extract_captions(ydl, info, language, folder)
+            if result:
+                return None, result
+        check_pause(stop)
+        stage = "下载媒体"
+        report(stage, None)
+        ydl.process_info(dict(info))
+        media = Path(ydl.prepare_filename(info))
+        if not media.is_file():
+            raise ValueError("下载结束后没有找到媒体文件。")
+        state["media"] = media.name
+        save_json(folder / "state.json", state)
+        return media, None
+
+
+def local_captions(media, language, stop):
+    # Prefer an explicitly named language track, then the matching plain sidecar.
+    stems = [media.stem]
+    if language and re.fullmatch(r"[A-Za-z0-9-]+", language):
+        stems.insert(0, f"{media.stem}.{language}")
+    for stem in stems:
+        for ext in ("srt", "vtt"):
+            path = media.with_name(f"{stem}.{ext}")
+            if path.is_file():
+                try:
+                    cues = list(read_cues(path.read_text(encoding="utf-8-sig"), ext, False))
+                except UnicodeDecodeError:
+                    continue
+                if cues:
+                    return cues, language or "未标注", "本地字幕"
+    import av
+
+    aliases = {"eng": "en", "zho": "zh", "chi": "zh", "jpn": "ja", "kor": "ko",
+               "fra": "fr", "fre": "fr", "deu": "de", "ger": "de", "spa": "es"}
+    with av.open(str(media)) as container:
+        for stream in container.streams.subtitles:
+            tag = base_lang(stream.metadata.get("language"))
+            tag = aliases.get(tag, tag)
+            if language and tag != base_lang(language):
+                continue
+            if stream.codec_context.name not in ("mov_text", "ass", "ssa", "subrip", "webvtt", "text"):
+                continue
+            if stream.disposition & av.stream.Disposition.forced:
+                continue
+            cues = []
+            origin = round((container.start_time or 0) / 1000)
+            container.seek(0)
+            for packet in container.demux(stream):
+                check_pause(stop)
+                if packet.pts is None or not packet.duration:
+                    continue
+                start = max(0, round(packet.pts * packet.time_base * 1000) - origin)
+                end = round((packet.pts + packet.duration) * packet.time_base * 1000) - origin
+                for part in packet.decode():
+                    words = getattr(part, "dialogue", b"").decode("utf-8", errors="replace")
+                    words = re.sub(r"\{\\[^}]*\}", "", words).replace(r"\N", " ").replace(r"\n", " ").strip()
+                    if words and end > start:
+                        cues.append((start, end, words))
+            if cues:
+                return cues, tag or "未标注", "内嵌字幕"
+    return None
+
+
+def run_job(source, output, model, language, from_audio, report, stop):
+    source = source.strip().strip('"')
+    local, folder = job_paths(source, output, model, language, from_audio)
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        lock = FileLock(str(folder / "run.lock")).acquire(timeout=0)
+    except Timeout as exc:
+        raise ValueError("同一任务已经在另一个窗口运行。") from exc
+    with lock:
+        checkpoint = folder / "state.json"
+        state = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else {}
+        state["request"] = dict(source=str(local or source), model=model, language=language or "", from_audio=from_audio)
+        state.setdefault("title", local.stem if local else (urlsplit(source).hostname or "视频"))
+        save_json(checkpoint, state)
+        media = local
+        audio = folder / "audio.wav"
+        result = None
+        if not audio.is_file():
+            if state.get("cursor"):
+                raise ValueError("断点所需的音频已丢失。请另选输出目录重新开始。")
+            if local:
+                state["title"] = local.stem
+                if not from_audio:
+                    report("检查本地字幕", None)
+                    result = local_captions(local, language, stop)
+            else:
+                media, result = online_source(source, folder, state, language, from_audio, report, stop)
+            check_pause(stop)
+            if result is None:
+                save_json(checkpoint, state)
+                decode_audio(media, audio, report, stop)
+        if result is None:
+            if state.get("media"):
+                (folder / state.pop("media")).unlink(missing_ok=True)
+                save_json(checkpoint, state)
+            result = recognize(folder, state, model, base_lang(language) or None, report, stop)
+        cues, lang, origin = result
+        plain, timed = save_result(output, state["title"], cues)
+        # This directory is private to a single hashed job. Only remove our files.
+        checkpoint.unlink(missing_ok=True)
+        audio.unlink(missing_ok=True)
+        for path in folder.glob("captions-*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+        report("已完成", 100)
+        return plain, timed, lang, origin, len(cues)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="视频分享链接转逐字稿")
-    parser.add_argument("url", help="单个视频的 HTTP(S) 链接")
+    parser = argparse.ArgumentParser(description="视频链接或本地音视频转逐字稿")
+    parser.add_argument("source", help="单个视频链接，或本地视频、音频文件路径")
     parser.add_argument("--language", help="视频原声语言，例如 zh 或 en")
     parser.add_argument("--from-audio", action="store_true", help="直接按原声转写")
     parser.add_argument("--model", default="small", help="本地 Whisper 模型路径或名称")
     parser.add_argument("--output-dir", type=Path, default=Path("transcripts"))
     args = parser.parse_args()
-    url = urlsplit(args.url)
-    if url.scheme not in ("https", "http") or not url.hostname:
-        parser.error("请输入完整的 HTTP(S) 视频链接。")
-    with tempfile.TemporaryDirectory(prefix="video-transcript-") as tmp:
-        temp = Path(tmp)
-        options = {
-            "quiet": True, "noprogress": True, "noplaylist": True,
-            "playlistend": 1, "extract_flat": "in_playlist", "socket_timeout": 30,
-            "writesubtitles": not args.from_audio, "writeautomaticsub": not args.from_audio,
-            "format": "bestaudio/best", "outtmpl": str(temp / "media.%(ext)s"),
-        }
-        with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(args.url, download=False)
-            ydl.params.update(writesubtitles=False, writeautomaticsub=False)
-            if not info or info.get("_type") in ("playlist", "multi_video") or info.get("is_live"):
-                raise ValueError("请提供单个已发布视频的链接。")
-            result = None if args.from_audio else extract_captions(ydl, info, args.language, temp)
-            cues, lang, source = result or transcribe_audio(ydl, info, args.language, args.model)
-    plain, timed = save_result(args.output_dir, info.get("title") or "video", cues)
-    print(f"来源：{source}；语言：{lang}；共 {len(cues)} 段\n逐字稿：{plain}\n时间轴：{timed}")
+    last = None
+
+    def report(stage, pct):
+        nonlocal last
+        mark = (stage, None if pct is None else int(pct) // 5 * 5)
+        if mark != last:
+            print(stage if pct is None else f"{stage} {mark[1]}%", file=sys.stderr, flush=True)
+            last = mark
+
+    result = run_job(args.source, args.output_dir, args.model, args.language,
+                     args.from_audio, report, threading.Event())
+    plain, timed, lang, origin, count = result
+    print(f"来源：{origin}；语言：{lang}；共 {count} 段\n逐字稿：{plain}\n时间轴：{timed}")
 
 
 if __name__ == "__main__":
@@ -192,5 +319,7 @@ if __name__ == "__main__":
             stream.reconfigure(encoding="utf-8")
     try:
         main()
+    except KeyboardInterrupt:
+        sys.exit("已中断。同样的输入、设置和输出目录可继续已保存的进度。")
     except Exception as error:
         sys.exit(f"生成失败：{error}")

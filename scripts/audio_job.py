@@ -38,11 +38,11 @@ def save_json(path, data):
         temp.unlink(missing_ok=True)
 
 
-def job_paths(source, output, model, language, from_audio):
+def job_paths(source, output, model, language, from_audio, browser=False):
     url = urlsplit(source) if source.startswith(("https://", "http://")) else None
     if url and url.hostname:
         local = None
-        identity = source
+        identity = [source, "browser"] if browser else source
     else:
         local = Path(source).expanduser().resolve()
         if not local.is_file():

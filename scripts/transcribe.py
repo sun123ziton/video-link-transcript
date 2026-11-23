@@ -153,7 +153,7 @@ def save_result(output, title, cues):
     return plain.resolve(), timed.resolve()
 
 
-def online_source(source, folder, state, language, from_audio, report, stop, speakers):
+def online_source(source, folder, state, language, from_audio, report, stop, speakers, browser=False):
     result = state.get("captions")
     if result and (not speakers or labeled(result[0])):
         return None, result
@@ -181,47 +181,65 @@ def online_source(source, folder, state, language, from_audio, report, stop, spe
         "format": "bestaudio/best", "outtmpl": str(folder / "media.%(ext)s"),
         "progress_hooks": [progress], "skip_unavailable_fragments": False,
     }
-    report("解析视频链接", None)
+    from browser_media import browser_retry, resolve_shared_page
     from pandacollege import is_replay, resolve_replay
-    replay_title = None
+
+    def read_media(url, title=None):
+        nonlocal result, stage
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+            check_pause(stop)
+            if not info or info.get("_type") in ("playlist", "multi_video") or info.get("is_live"):
+                raise ValueError("请提供单个已发布视频的链接。")
+            state["title"] = title or info.get("title") or "video"
+            ydl.params.update(writesubtitles=False, writeautomaticsub=False)
+            if not from_audio and result is None:
+                report("读取平台字幕", None)
+                result = extract_captions(ydl, info, language, folder, speakers)
+                if result:
+                    if not speakers or labeled(result[0]):
+                        return None, result
+                    state["captions"] = result
+                    save_json(folder / "state.json", state)
+            check_pause(stop)
+            stage = "下载媒体"
+            report(stage, None)
+            ydl.process_info(dict(info))
+            media = Path(ydl.prepare_filename(info))
+            if not media.is_file():
+                raise ValueError("下载结束后没有找到媒体文件。")
+            state["media"] = media.name
+            save_json(folder / "state.json", state)
+            return media, result
+
+    report("解析视频链接", None)
     if is_replay(source):
-        media_url, replay_title, agent = resolve_replay(source, report, stop)
+        media_url, title, agent = resolve_replay(source, report, stop)
         options["http_headers"] = {"Referer": source, "User-Agent": agent}
-        source = media_url
-        report("读取已登录课程的回放媒体", None)
-    with YoutubeDL(options) as ydl:
+        return read_media(media_url, title)
+    if not browser:
         try:
-            info = ydl.extract_info(source, download=False)
+            return read_media(source)
         except DownloadError as exc:
-            reason = str(exc).lower()
-            if any(hint in reason for hint in ("/login", "login required", "sign in", "log in")):
-                raise ValueError("平台要求登录。可拖入已取得的本地视频、录音，或粘贴可播放的媒体直链。") from exc
-            if "unsupported url" in reason:
-                raise ValueError("暂时无法解析这个页面。请使用媒体直链，或拖入本地视频、录音。") from exc
-            raise
-        check_pause(stop)
-        if not info or info.get("_type") in ("playlist", "multi_video") or info.get("is_live"):
-            raise ValueError("请提供单个已发布视频的链接。")
-        state["title"] = replay_title or info.get("title") or "video"
-        ydl.params.update(writesubtitles=False, writeautomaticsub=False)
-        if not from_audio and result is None:
-            report("读取平台字幕", None)
-            result = extract_captions(ydl, info, language, folder, speakers)
-            if result:
-                if not speakers or labeled(result[0]):
-                    return None, result
-                state["captions"] = result
-                save_json(folder / "state.json", state)
-        check_pause(stop)
-        stage = "下载媒体"
-        report(stage, None)
-        ydl.process_info(dict(info))
-        media = Path(ydl.prepare_filename(info))
-        if not media.is_file():
-            raise ValueError("下载结束后没有找到媒体文件。")
-        state["media"] = media.name
+            check_pause(stop)
+            if not browser_retry(exc):
+                raise
+    # A share page may contain several items. Don't reuse a guessed item's
+    # subtitles or append to its partially downloaded file after user selection.
+    result = None
+    if state.pop("captions", None) is not None:
         save_json(folder / "state.json", state)
-        return media, result
+    location, title, headers = resolve_shared_page(source, folder, report, stop)
+    if isinstance(location, Path):
+        state.update(title=title, media=location.name)
+        save_json(folder / "state.json", state)
+        return location, None
+    options.update(http_headers=headers, continuedl=False, overwrites=True,
+                   outtmpl=str(folder / "browser-media.%(ext)s"))
+    try:
+        return read_media(location, title)
+    except DownloadError as exc:
+        raise ValueError("播放器已打开，但下载器未能取得完整媒体。可将平台提供下载的文件拖入工具。") from exc
 
 
 def local_captions(media, language, stop, speakers):
@@ -272,9 +290,9 @@ def local_captions(media, language, stop, speakers):
     return None
 
 
-def run_job(source, output, model, language, from_audio, report, stop, speakers=True):
+def run_job(source, output, model, language, from_audio, report, stop, speakers=True, browser=False):
     source = source.strip().strip('"')
-    local, folder = job_paths(source, output, model, language, from_audio)
+    local, folder = job_paths(source, output, model, language, from_audio, browser=browser)
     folder.mkdir(parents=True, exist_ok=True)
     try:
         lock = FileLock(str(folder / "run.lock")).acquire(timeout=0)
@@ -284,7 +302,7 @@ def run_job(source, output, model, language, from_audio, report, stop, speakers=
         checkpoint = folder / "state.json"
         state = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else {}
         state["request"] = dict(source=str(local or source), model=model, language=language or "",
-                                from_audio=from_audio, speakers=speakers)
+                                from_audio=from_audio, speakers=speakers, browser=browser)
         state.setdefault("title", local.stem if local else (urlsplit(source).hostname or "视频"))
         save_json(checkpoint, state)
         media = local
@@ -299,7 +317,7 @@ def run_job(source, output, model, language, from_audio, report, stop, speakers=
                     report("检查本地字幕", None)
                     result = local_captions(local, language, stop, speakers)
             else:
-                media, result = online_source(source, folder, state, language, from_audio, report, stop, speakers)
+                media, result = online_source(source, folder, state, language, from_audio, report, stop, speakers, browser)
             check_pause(stop)
             if result is None or (speakers and not labeled(result[0])):
                 if result:
@@ -335,6 +353,7 @@ def main():
     parser.add_argument("source", help="单个视频链接，或本地视频、音频文件路径")
     parser.add_argument("--language", help="视频原声语言，例如 zh 或 en")
     parser.add_argument("--from-audio", action="store_true", help="直接按原声转写")
+    parser.add_argument("--browser", action="store_true", help="直接用浏览器登录并选择播放器")
     parser.add_argument("--no-speakers", action="store_true", help="跳过发言人分析")
     parser.add_argument("--model", default="small", help="本地 Whisper 模型路径或名称")
     parser.add_argument("--output-dir", type=Path, default=Path("transcripts"))
@@ -349,7 +368,7 @@ def main():
             last = mark
 
     result = run_job(args.source, args.output_dir, args.model, args.language,
-                     args.from_audio, report, threading.Event(), speakers=not args.no_speakers)
+                     args.from_audio, report, threading.Event(), speakers=not args.no_speakers, browser=args.browser)
     plain, timed, lang, origin, count = result
     print(f"来源：{origin}；语言：{lang}；共 {count} 段\n逐字稿：{plain}\n时间轴：{timed}")
 

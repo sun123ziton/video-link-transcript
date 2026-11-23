@@ -1,11 +1,10 @@
 """Resolve a Panda College replay through the site's normal, interactive player."""
 
-import sys
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from filelock import FileLock, Timeout
+from browser_media import open_player
 
 from audio_job import check_pause
 
@@ -90,34 +89,7 @@ def _wait_for_player(page, source, report, stop, timeout):
 
 
 def resolve_replay(source, report, stop):
-    from playwright.sync_api import Error, sync_playwright
-
     if not is_replay(source):
         raise ValueError("请输入有效的课程回放分享链接。")
     profile = Path.home() / ".video-link-transcript" / "pandacollege-browser"
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    channels = ("msedge", "chrome", None) if sys.platform == "win32" else ("chrome", None)
-    report("正在打开课程浏览器", None)
-    try:
-        lock = FileLock(str(profile) + ".lock").acquire(timeout=0)
-    except Timeout as exc:
-        raise ValueError("另一个任务正在使用课程浏览器，请先完成该窗口的登录或播放。") from exc
-    with lock, sync_playwright() as pw:
-        for channel in channels:
-            check_pause(stop)
-            try:
-                browser = pw.chromium.launch_persistent_context(
-                    str(profile), channel=channel, headless=False, viewport=None)
-                break
-            except Error as exc:
-                if "not found" not in str(exc).lower() and "doesn't exist" not in str(exc).lower():
-                    raise ValueError("课程浏览器启动失败，请关闭工具之前弹出的课程窗口后重试。") from exc
-        else:
-            raise ValueError("未找到可用浏览器。请安装 Edge、Chrome 或执行 python -m playwright install chromium。")
-        try:
-            page = browser.pages[0] if browser.pages else browser.new_page()
-            page.add_init_script("performance.setResourceTimingBufferSize(2000)")
-            page.bring_to_front()
-            return _wait_for_player(page, source, report, stop, timeout=300)
-        finally:
-            browser.close()
+    return open_player(profile, report, stop, lambda page: _wait_for_player(page, source, report, stop, timeout=300))

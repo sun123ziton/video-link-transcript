@@ -42,6 +42,7 @@ class Window:
         self.mode = tk.StringVar(value=prefs.get("mode", next(iter(MODES))))
         self.language = tk.StringVar(value=prefs.get("language", "自动识别"))
         self.audio_only = tk.BooleanVar(value=prefs.get("audio_only", False))
+        self.browser = tk.BooleanVar(value=False)
         self.speakers = tk.BooleanVar(value=prefs.get("speakers", True))
         self.status = tk.StringVar(value="就绪")
         self.stop = threading.Event()
@@ -92,7 +93,9 @@ class Window:
         self.history_menu = tk.Menu(history, tearoff=False, postcommand=self.refresh_history)
         history.configure(menu=self.history_menu)
         history.pack(side="left")
-        self.editable.append(history)
+        browser = ttk.Checkbutton(actions, text="直接用浏览器打开", variable=self.browser)
+        browser.pack(side="left", padx=(8, 0))
+        self.editable.extend((history, browser))
         self.progress = ttk.Progressbar(panel, maximum=100)
         self.progress.grid(row=6, column=0, columnspan=2, sticky="ew", pady=6)
         ttk.Label(panel, textvariable=self.status, wraplength=510).grid(row=7, column=0, columnspan=2, sticky="w")
@@ -125,6 +128,7 @@ class Window:
             self.language.set(next(k for k, v in LANGUAGES.items() if v == req["language"]))
             self.audio_only.set(req["from_audio"])
             self.speakers.set(req.get("speakers", True))
+            self.browser.set(req.get("browser", False))
             self.status.set("已选中任务。点「开始 / 继续」恢复。")
         cache = Path(self.output.get()).expanduser() / ".video-link-transcript"
         for path in sorted(cache.glob("*/state.json")):
@@ -158,6 +162,7 @@ class Window:
             return
         mode, lang, audio = self.mode.get(), self.language.get(), self.audio_only.get()
         speakers = self.speakers.get()
+        browser = self.browser.get()
         try:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
             save_json(CONFIG, dict(source=source, output=dest, mode=mode, language=lang, audio_only=audio, speakers=speakers))
@@ -178,7 +183,7 @@ class Window:
                 self.events.put(("progress", (stage, percent)))
             try:
                 result = run_job(source, Path(dest).expanduser(), MODES[mode], LANGUAGES[lang],
-                                 audio, report, self.stop, speakers=speakers)
+                                 audio, report, self.stop, speakers=speakers, browser=browser)
                 self.events.put(("done", result))
             except Paused:
                 self.events.put(("paused", "已暂停。点「开始 / 继续」可从上次保存的位置继续。"))

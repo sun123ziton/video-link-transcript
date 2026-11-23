@@ -182,6 +182,13 @@ def online_source(source, folder, state, language, from_audio, report, stop, spe
         "progress_hooks": [progress], "skip_unavailable_fragments": False,
     }
     report("解析视频链接", None)
+    from pandacollege import is_replay, resolve_replay
+    replay_title = None
+    if is_replay(source):
+        media_url, replay_title, agent = resolve_replay(source, report, stop)
+        options["http_headers"] = {"Referer": source, "User-Agent": agent}
+        source = media_url
+        report("读取已登录课程的回放媒体", None)
     with YoutubeDL(options) as ydl:
         try:
             info = ydl.extract_info(source, download=False)
@@ -195,7 +202,7 @@ def online_source(source, folder, state, language, from_audio, report, stop, spe
         check_pause(stop)
         if not info or info.get("_type") in ("playlist", "multi_video") or info.get("is_live"):
             raise ValueError("请提供单个已发布视频的链接。")
-        state["title"] = info.get("title") or "video"
+        state["title"] = replay_title or info.get("title") or "video"
         ydl.params.update(writesubtitles=False, writeautomaticsub=False)
         if not from_audio and result is None:
             report("读取平台字幕", None)

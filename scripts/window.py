@@ -7,16 +7,18 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from audio_job import Paused, save_json
-from transcribe import run_job
+from completed_history import completed_exports
+from transcribe import CHINESE_SCRIPTS, run_job
 
 CONFIG = Path.home() / ".video-link-transcript" / "window.json"
-MODES = {"快速 · base": "base", "精细 · small": "small"}
+MODES = {"精细 · small": "small", "快速 · base": "base", "高精度 · medium": "medium"}
 LANGUAGES = {"自动识别": "", "中文": "zh", "英语": "en"}
 
 
@@ -25,6 +27,75 @@ def open_file(path):
         os.startfile(path)
     else:
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+
+
+class CompletedWindow(tk.Toplevel):
+    def __init__(self, root):
+        super().__init__(root)
+        self.title("已完成记录")
+        self.geometry("680x330")
+        self.minsize(500, 245)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        panel = ttk.Frame(self, padding=10)
+        panel.grid(sticky="nsew")
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(0, weight=1)
+        self.rows = ttk.Treeview(panel, columns=("title", "time"), show="headings", selectmode="browse")
+        self.rows.heading("title", text="视频 / 音频")
+        self.rows.heading("time", text="保存时间")
+        self.rows.column("time", width=145, stretch=False)
+        self.rows.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(panel, command=self.rows.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.rows.configure(yscrollcommand=scroll.set)
+        self.details = tk.StringVar()
+        ttk.Label(panel, textvariable=self.details, wraplength=470).grid(row=1, column=0, sticky="w", pady=6)
+        actions = ttk.Frame(panel)
+        actions.grid(row=2, column=0, sticky="w")
+        self.buttons = []
+        for label, name in (("打开逐字稿 TXT", "transcript.txt"), ("打开时间轴 SRT", "transcript.srt"),
+                            ("打开所在文件夹", "")):
+            button = ttk.Button(actions, text=label, command=lambda n=name: self.open_selected(n))
+            button.pack(side="left", padx=(0, 8))
+            self.buttons.append((button, name))
+        self.rows.bind("<<TreeviewSelect>>", lambda _: self.show_path())
+        self.rows.bind("<Return>", lambda _: self.open_selected("transcript.txt"))
+        self.rows.bind("<Double-1>", lambda e: self.open_selected("transcript.txt") if self.rows.identify_row(e.y) else None)
+
+    def refresh(self, outputs):
+        previous = self.rows.selection()
+        records, self.warning = completed_exports(outputs)
+        self.rows.delete(*self.rows.get_children())
+        for folder, title, saved in records:
+            stamp = datetime.fromtimestamp(saved).strftime("%Y-%m-%d %H:%M")
+            self.rows.insert("", "end", iid=str(folder), values=(title, stamp))
+        if records:
+            selected = previous[0] if previous and self.rows.exists(previous[0]) else str(records[0].folder)
+            self.rows.selection_set(selected)
+            self.rows.see(selected)
+        self.show_path()
+
+    def show_path(self):
+        selection = self.rows.selection()
+        folder = Path(selection[0]) if selection else None
+        info = str(folder) if folder else "尚未找到已完成的逐字稿。"
+        if folder and not folder.is_dir():
+            info = f"原保存位置无法访问：{folder}"
+        self.details.set("\n".join(filter(None, (self.warning, info))))
+        for button, name in self.buttons:
+            exists = folder and ((folder / name).is_file() if name else folder.is_dir())
+            button.state(["!disabled"] if exists else ["disabled"])
+
+    def open_selected(self, name):
+        selection = self.rows.selection()
+        if selection:
+            path = Path(selection[0]) / name
+            try:
+                open_file(path)
+            except OSError as exc:
+                messagebox.showerror("无法打开", str(exc), parent=self)
+            self.show_path()
 
 
 class Window:
@@ -38,9 +109,15 @@ class Window:
         except (ValueError, OSError):
             prefs = {}
         self.source = tk.StringVar(value=prefs.get("source", ""))
-        self.output = tk.StringVar(value=prefs.get("output", str(Path.home() / "Documents" / "视频逐字稿")))
-        self.mode = tk.StringVar(value=prefs.get("mode", next(iter(MODES))))
+        self.default_output = Path.home() / "Documents" / "视频逐字稿"
+        self.last_output = prefs.get("output", str(self.default_output))
+        self.output = tk.StringVar(value=self.last_output)
+        self.completed_window = None
+        # Earlier windows persisted the old fast default even without a user choice.
+        mode = prefs.get("mode") if "chinese_script" in prefs else None
+        self.mode = tk.StringVar(value=mode if mode in MODES else "精细 · small")
         self.language = tk.StringVar(value=prefs.get("language", "自动识别"))
+        self.chinese_script = tk.StringVar(value=prefs.get("chinese_script", "简体中文"))
         self.audio_only = tk.BooleanVar(value=prefs.get("audio_only", False))
         self.browser = tk.BooleanVar(value=False)
         self.speakers = tk.BooleanVar(value=prefs.get("speakers", True))
@@ -70,21 +147,26 @@ class Window:
         dest_button = ttk.Button(panel, text="选择目录…", command=self.choose_output)
         dest_button.grid(row=3, column=1, padx=(8, 0), pady=(4, 12))
 
-        options = ttk.Frame(panel)
-        options.grid(row=4, column=0, columnspan=2, sticky="w")
-        for label, var, values in (("模型", self.mode, MODES), ("原声", self.language, LANGUAGES)):
+        settings = ttk.Frame(panel)
+        settings.grid(row=4, column=0, columnspan=2, sticky="w")
+        options = ttk.Frame(settings)
+        options.pack(anchor="w")
+        for label, var, values, width in (("模型", self.mode, MODES, 14), ("原声", self.language, LANGUAGES, 8),
+                                          ("中文字形", self.chinese_script, CHINESE_SCRIPTS, 9)):
             ttk.Label(options, text=label).pack(side="left")
-            combo = ttk.Combobox(options, textvariable=var, values=list(values), width=13, state="readonly")
+            combo = ttk.Combobox(options, textvariable=var, values=list(values), width=width, state="readonly")
             combo.pack(side="left", padx=(4, 14))
             self.editable.append(combo)
-        audio = ttk.Checkbutton(options, text="忽略字幕，按原声转写", variable=self.audio_only)
+        checks = ttk.Frame(settings)
+        checks.pack(anchor="w", pady=(4, 0))
+        audio = ttk.Checkbutton(checks, text="忽略字幕，按原声转写", variable=self.audio_only)
         audio.pack(side="left")
-        speakers = ttk.Checkbutton(panel, text="区分发言人", variable=self.speakers)
-        speakers.grid(row=5, column=1, sticky="e")
+        speakers = ttk.Checkbutton(checks, text="区分发言人", variable=self.speakers)
+        speakers.pack(side="left", padx=(12, 0))
         self.editable.extend((audio, speakers, self.source_entry, browse, dest, dest_button))
 
         actions = ttk.Frame(panel)
-        actions.grid(row=5, column=0, sticky="w", pady=(15, 5))
+        actions.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 5))
         self.start_button = ttk.Button(actions, text="开始 / 继续", command=self.start)
         self.start_button.pack(side="left")
         self.pause_button = ttk.Button(actions, text="暂停", command=self.pause, state="disabled")
@@ -101,6 +183,7 @@ class Window:
         ttk.Label(panel, textvariable=self.status, wraplength=510).grid(row=7, column=0, columnspan=2, sticky="w")
         files = ttk.Frame(panel)
         files.grid(row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(files, text="已完成记录", command=self.show_completed).pack(side="left", padx=(0, 8))
         self.file_buttons = []
         for idx, name in enumerate(("打开逐字稿 TXT", "打开时间轴 SRT")):
             button = ttk.Button(files, text=name, state="disabled", command=lambda i=idx: open_file(self.result[i]))
@@ -113,6 +196,13 @@ class Window:
         path = filedialog.askopenfilename(title="选择本地视频或音频")
         if path:
             self.source.set(path)
+
+    def show_completed(self):
+        if self.completed_window is None or not self.completed_window.winfo_exists():
+            self.completed_window = CompletedWindow(self.root)
+        self.completed_window.refresh((self.output.get().strip(), self.last_output, self.default_output))
+        self.completed_window.deiconify()
+        self.completed_window.lift()
 
     def choose_output(self):
         path = filedialog.askdirectory(title="选择输出目录")
@@ -129,6 +219,7 @@ class Window:
             self.audio_only.set(req["from_audio"])
             self.speakers.set(req.get("speakers", True))
             self.browser.set(req.get("browser", False))
+            self.chinese_script.set(next((k for k, v in CHINESE_SCRIPTS.items() if v == req.get("chinese_script")), "简体中文"))
             self.status.set("已选中任务。点「开始 / 继续」恢复。")
         cache = Path(self.output.get()).expanduser() / ".video-link-transcript"
         for path in sorted(cache.glob("*/state.json")):
@@ -163,9 +254,11 @@ class Window:
         mode, lang, audio = self.mode.get(), self.language.get(), self.audio_only.get()
         speakers = self.speakers.get()
         browser = self.browser.get()
+        script = self.chinese_script.get()
         try:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
-            save_json(CONFIG, dict(source=source, output=dest, mode=mode, language=lang, audio_only=audio, speakers=speakers))
+            save_json(CONFIG, dict(source=source, output=dest, mode=mode, language=lang, audio_only=audio,
+                                   speakers=speakers, chinese_script=script))
         except OSError as exc:
             self.status.set(f"无法保存窗口设置：{exc}")
             return
@@ -183,7 +276,8 @@ class Window:
                 self.events.put(("progress", (stage, percent)))
             try:
                 result = run_job(source, Path(dest).expanduser(), MODES[mode], LANGUAGES[lang],
-                                 audio, report, self.stop, speakers=speakers, browser=browser)
+                                 audio, report, self.stop, speakers=speakers, browser=browser,
+                                 chinese_script=CHINESE_SCRIPTS[script])
                 self.events.put(("done", result))
             except Paused:
                 self.events.put(("paused", "已暂停。点「开始 / 继续」可从上次保存的位置继续。"))
@@ -231,6 +325,8 @@ class Window:
                 self.status.set(f"已完成 · {value[3]} · {value[2]} · 共 {value[4]} 段")
                 for button in self.file_buttons:
                     button.state(["!disabled"])
+                if self.completed_window is not None and self.completed_window.winfo_exists():
+                    self.completed_window.refresh((self.output.get(), self.last_output, self.default_output))
                 self.root.bell()
             else:
                 self.status.set(value if kind == "paused" else f"生成失败：{value}")

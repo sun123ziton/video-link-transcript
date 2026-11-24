@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from threading import Event
+from unittest.mock import patch
 
 import numpy as np
 
@@ -38,7 +39,7 @@ class SpeakerTests(unittest.TestCase):
         self.assertEqual(caption_cues(vtt, "vtt", False, False)[0][2], "你好")
 
     def test_named_sidecar_exports_without_an_audio_pass(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, patch("completed_history.DATABASE", Path(temp) / "history.sqlite3"):
             root = Path(temp)
             media = root / "dialogue.mp4"
             media.touch()

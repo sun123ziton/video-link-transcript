@@ -4,6 +4,7 @@ import argparse
 import html
 import json
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from filelock import FileLock, Timeout
 from audio_job import Paused, check_pause, decode_audio, job_paths, recognize, save_json
+from completed_history import remember_export
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, sanitize_filename
 
@@ -134,6 +136,28 @@ def extract_captions(ydl, info, language, temp, speakers):
     return None
 
 
+CHINESE_SCRIPTS = {"简体中文": "simplified", "繁體中文": "traditional", "保留原文": "original"}
+
+
+def export_cues(cues, language, script):
+    if script == "original":
+        return cues
+    if script not in ("simplified", "traditional"):
+        raise ValueError("请选择简体中文、繁體中文或保留原文。")
+    lang = base_lang(language)
+    if lang in ("", "und", "未标注"):
+        # Untagged subtitles can also be Japanese or Korean.
+        if any(re.search(r"[\u3040-\u30ff\uac00-\ud7af]", line) for _, _, line in cues):
+            return cues
+        if not any(re.search(r"[\u3400-\u9fff]", line.split("：", 1)[-1]) for _, _, line in cues):
+            return cues
+    elif lang not in ("zh", "zho", "chi", "yue", "cmn", "wuu", "nan", "hak"):
+        return cues
+    from opencc import OpenCC
+    converter = OpenCC("t2s" if script == "simplified" else "s2t")
+    return [(start, end, converter.convert(line)) for start, end, line in cues]
+
+
 def save_result(output, title, cues):
     output.mkdir(parents=True, exist_ok=True)
     prefix = sanitize_filename(title, restricted=False).strip(" .")[:60] or "video"
@@ -142,14 +166,20 @@ def save_result(output, title, cues):
     timed = folder / "transcript.srt"
     try:
         plain.write_text("".join(f"{words}\n" for _, _, words in cues), encoding="utf-8")
-        with timed.open("w", encoding="utf-8") as handle:
+        with timed.with_suffix(".part").open("w", encoding="utf-8") as handle:
             for index, (start, end, words) in enumerate(cues, 1):
                 handle.write(f"{index}\n{timestamp(start)} --> {timestamp(end)}\n{words}\n\n")
+        timed.with_suffix(".part").replace(timed)
     except BaseException:
         plain.unlink(missing_ok=True)
         timed.unlink(missing_ok=True)
+        timed.with_suffix(".part").unlink(missing_ok=True)
         folder.rmdir()
         raise
+    try:
+        remember_export(timed, title)
+    except (OSError, sqlite3.Error):
+        print(f"历史索引暂时无法更新，逐字稿已保存在 {folder.resolve()}", file=sys.stderr)
     return plain.resolve(), timed.resolve()
 
 
@@ -290,7 +320,8 @@ def local_captions(media, language, stop, speakers):
     return None
 
 
-def run_job(source, output, model, language, from_audio, report, stop, speakers=True, browser=False):
+def run_job(source, output, model, language, from_audio, report, stop, speakers=True, browser=False,
+            chinese_script="simplified"):
     source = source.strip().strip('"')
     local, folder = job_paths(source, output, model, language, from_audio, browser=browser)
     folder.mkdir(parents=True, exist_ok=True)
@@ -302,7 +333,7 @@ def run_job(source, output, model, language, from_audio, report, stop, speakers=
         checkpoint = folder / "state.json"
         state = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else {}
         state["request"] = dict(source=str(local or source), model=model, language=language or "",
-                                from_audio=from_audio, speakers=speakers, browser=browser)
+                                from_audio=from_audio, speakers=speakers, browser=browser, chinese_script=chinese_script)
         state.setdefault("title", local.stem if local else (urlsplit(source).hostname or "视频"))
         save_json(checkpoint, state)
         media = local
@@ -336,7 +367,7 @@ def run_job(source, output, model, language, from_audio, report, stop, speakers=
             check_pause(stop)
             cues = label_cues(cues, state.get("words", {}), turns)
             origin += " · 本地发言人分析"
-        plain, timed = save_result(output, state["title"], cues)
+        plain, timed = save_result(output, state["title"], export_cues(cues, language or lang, chinese_script))
         # This directory is private to a single hashed job. Only remove our files.
         checkpoint.unlink(missing_ok=True)
         audio.unlink(missing_ok=True)
@@ -356,6 +387,8 @@ def main():
     parser.add_argument("--browser", action="store_true", help="直接用浏览器登录并选择播放器")
     parser.add_argument("--no-speakers", action="store_true", help="跳过发言人分析")
     parser.add_argument("--model", default="small", help="本地 Whisper 模型路径或名称")
+    parser.add_argument("--chinese-script", choices=CHINESE_SCRIPTS.values(), default="simplified",
+                        help="中文输出字形：简体（默认）、繁体或保留原文")
     parser.add_argument("--output-dir", type=Path, default=Path("transcripts"))
     args = parser.parse_args()
     last = None
@@ -368,7 +401,8 @@ def main():
             last = mark
 
     result = run_job(args.source, args.output_dir, args.model, args.language,
-                     args.from_audio, report, threading.Event(), speakers=not args.no_speakers, browser=args.browser)
+                     args.from_audio, report, threading.Event(), speakers=not args.no_speakers, browser=args.browser,
+                     chinese_script=args.chinese_script)
     plain, timed, lang, origin, count = result
     print(f"来源：{origin}；语言：{lang}；共 {count} 段\n逐字稿：{plain}\n时间轴：{timed}")
 
